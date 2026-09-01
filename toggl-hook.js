@@ -320,11 +320,17 @@ async function forceStop() {
 function prompter() {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: !!process.stdin.isTTY });
-  const lines = []; const waiting = [];
+  const lines = []; const waiting = []; let closed = false;
   rl.on('line', (l) => { if (waiting.length) waiting.shift()(l); else lines.push(l); });
-  rl.on('close', () => { while (waiting.length) waiting.shift()(''); }); // EOF: remaining questions get the default
+  rl.on('close', () => { closed = true; while (waiting.length) waiting.shift()(''); }); // EOF: remaining questions get the default
+  if (!process.stdin.isTTY) console.log('(stdin is not a terminal — unanswered questions keep their defaults; run setup in a terminal to answer interactively)');
   return {
-    ask: (q) => new Promise((r) => { process.stdout.write(q); if (lines.length) r(lines.shift().trim()); else waiting.push((l) => r(l.trim())); }),
+    ask: (q) => new Promise((r) => {
+      process.stdout.write(q);
+      if (lines.length) r(lines.shift().trim());
+      else if (closed) { console.log(''); r(''); }
+      else waiting.push((l) => r(l.trim()));
+    }),
     close: () => rl.close(),
   };
 }
@@ -380,7 +386,8 @@ async function setup() {
       console.log(`\nFolders you have used Claude Code or Gemini CLI in. Pick the Toggl project each belongs to:\n  ${menu}\n  Enter = skip, i = ignore (never ask again), q = stop asking\n`);
       for (const f of pending) {
         if (projectFor(f, cfg) || isIgnored(f, cfg)) continue; // covered by an earlier answer
-        const a = await p.ask(`  ${tilde(f)}: `);
+        const inside = pending.filter((o) => under(o, f) > 0 && o !== f).length; // a parent folder: mapping it maps everything below
+        const a = await p.ask(`  ${tilde(f)}${inside ? ` (contains ${inside} of the folders below)` : ''}: `);
         if (a === 'q') break;
         if (a === 'i') { cfg.ignore.push(tilde(f)); continue; }
         const name = a && pick(a);

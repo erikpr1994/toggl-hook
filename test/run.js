@@ -218,6 +218,10 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   assert.deepStrictEqual(c2.projects.Startup, { id: 1, paths: ['~/code/api'] });
   assert.deepStrictEqual(c2.projects['Client A'], { id: 2, paths: ['~/code/other'] });
   assert.deepStrictEqual(c2.ignore, ['~/code/site']);
+  // 14b. no terminal and no answers (e.g. run from a hook or `!` in Claude Code): finishes with defaults instead of hanging
+  const su2 = spawnSync(process.execPath, [SCRIPT, 'setup'], { env: { ...env, HOME: home, TT_DIR: TT2 }, input: '', encoding: 'utf8', timeout: 10000 });
+  assert.strictEqual(su2.status, 0, su2.stderr || 'timed out'); assert.match(su2.stdout, /not a terminal/); assert.match(su2.stdout, /Saved/);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(TT2, 'config.json'), 'utf8')).projects.Startup, { id: 1, paths: ['~/code/api'] }, 'earlier mapping kept');
   fs.rmSync(TT2, { recursive: true, force: true });
 
   console.log('all tests passed');
