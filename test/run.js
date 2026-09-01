@@ -179,6 +179,47 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   const r = spawnSync(process.execPath, [SCRIPT, 'hook', 'claude'], { env: envDown, input: JSON.stringify({ session_id: 'y', cwd: '/repos/client-a', hook_event_name: 'UserPromptSubmit' }), encoding: 'utf8' });
   assert.strictEqual(r.status, 0); assert.strictEqual(r.stdout, ''); assert.match(state().lastError, /fetch|ECONNREFUSED/i);
 
+  // 13. SessionStart in an unmapped folder tells the assistant how to map it; `ignore` silences it, `map` un-ignores
+  let ctx = hook('claude', 'SessionStart', 'u1', '/repos/unknown');
+  assert.match(ctx, /not mapped to a Toggl project/); assert.match(ctx, /map "<Project>" "\/repos\/unknown"/); assert.match(ctx, /"Startup", "Client A"/);
+  assert.strictEqual(hook('claude', 'UserPromptSubmit', 'u1', '/repos/unknown'), '', 'only on SessionStart');
+  const gem = JSON.parse(hook('gemini', 'SessionStart', 'u2', '/repos/unknown'));
+  assert.strictEqual(gem.hookSpecificOutput.hookEventName, 'SessionStart'); assert.match(gem.hookSpecificOutput.additionalContext, /not mapped/);
+  assert.match(run(['status']), /unmapped folder.*\/repos\/unknown/);
+  assert.match(run(['ignore', '/repos/unknown/']), /Ignored: \/repos\/unknown/);
+  assert.strictEqual(hook('claude', 'SessionStart', 'u3', '/repos/unknown/sub'), '', 'ignored subfolder is silent');
+  assert.strictEqual(hook('gemini', 'SessionStart', 'u4', '/repos/unknown'), '{}');
+  assert.doesNotMatch(run(['status']), /unmapped folder/); assert.match(run(['status']), /Ignored folders: \/repos\/unknown/);
+  run(['map', 'Client A', '/repos/unknown']);
+  const cfgNow = JSON.parse(fs.readFileSync(path.join(TT_DIR, 'config.json'), 'utf8'));
+  assert.deepStrictEqual(cfgNow.ignore, [], 'map removes the folder from ignore');
+  assert.ok(cfgNow.projects['Client A'].paths.includes('/repos/unknown'));
+  assert.strictEqual(hook('claude', 'SessionStart', 'u5', '/repos/unknown'), '', 'mapped now');
+  assert.strictEqual(state().entries[2].live, true, 'SessionStart in a mapped folder starts tracking');
+  hook('claude', 'SessionEnd', 'u5', '/repos/unknown');
+  if (process.platform === 'darwin' || process.platform === 'win32') {
+    hook('claude', 'UserPromptSubmit', 'u6', '/repos/CLIENT-A/App');
+    assert.strictEqual(state().entries[2].live, true, 'case-insensitive match on case-insensitive file systems');
+    hook('claude', 'SessionEnd', 'u6', '/repos/CLIENT-A/App');
+  }
+
+  // 14. setup: offers the repos you used Claude/Gemini in (collapsed to git roots), accepts piped answers, saves mapping + ignore
+  const home = path.join(TT_DIR, 'home');
+  for (const d of ['code/api/.git', 'code/api/packages/web', 'code/site', '.gemini']) fs.mkdirSync(path.join(home, d), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ projects: { [path.join(home, 'code/api/packages/web')]: {}, [home]: {}, [path.join(home, 'code/gone')]: {} } }));
+  fs.writeFileSync(path.join(home, '.gemini/projects.json'), JSON.stringify({ projects: { [path.join(home, 'code/site')]: 'site' } }));
+  const TT2 = fs.mkdtempSync(path.join(os.tmpdir(), 'tt2-'));
+  const su = spawnSync(process.execPath, [SCRIPT, 'setup'], { env: { ...env, HOME: home, TT_DIR: TT2 }, input: 'tok\n1\ni\n2 ~/code/other\n\n7\n', encoding: 'utf8' });
+  assert.strictEqual(su.status, 0, su.stderr);
+  assert.match(su.stdout, /Hi Test User/); assert.match(su.stdout, /~\/code\/api: /); assert.match(su.stdout, /~\/code\/site: /);
+  assert.doesNotMatch(su.stdout, /packages\/web/, 'nested folder collapsed to its git root');
+  const c2 = JSON.parse(fs.readFileSync(path.join(TT2, 'config.json'), 'utf8'));
+  assert.strictEqual(c2.apiToken, 'tok'); assert.strictEqual(c2.workspaceId, 42); assert.strictEqual(c2.idleMinutes, 7);
+  assert.deepStrictEqual(c2.projects.Startup, { id: 1, paths: ['~/code/api'] });
+  assert.deepStrictEqual(c2.projects['Client A'], { id: 2, paths: ['~/code/other'] });
+  assert.deepStrictEqual(c2.ignore, ['~/code/site']);
+  fs.rmSync(TT2, { recursive: true, force: true });
+
   console.log('all tests passed');
   mock.kill(); fs.rmSync(TT_DIR, { recursive: true, force: true });
 })().catch((e) => { console.error(e); mock.kill(); process.exit(1); });

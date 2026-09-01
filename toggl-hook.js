@@ -5,11 +5,12 @@
  *
  * Zero dependencies. Node >= 18 (uses global fetch).
  *
- *   node toggl-hook.js setup        interactive: API token, workspace, project → folder mapping
+ *   node toggl-hook.js setup        interactive: API token, workspace, pick a Toggl project for each repo you use
  *   node toggl-hook.js install      register hooks in ~/.claude and ~/.gemini + idle watchdog (launchd)
  *   node toggl-hook.js uninstall    remove them again
  *   node toggl-hook.js status       what is running, what is mapped, last error
  *   node toggl-hook.js map "Toggl Project" ~/path/to/repo
+ *   node toggl-hook.js ignore ~/path/to/repo      never track (or ask about) this folder
  *   node toggl-hook.js stop         force-stop the running AI timer now
  *   node toggl-hook.js hook claude  (called by hooks; reads the hook JSON on stdin)
  *   node toggl-hook.js hook gemini
@@ -22,6 +23,9 @@
  * project share one entry. Several projects can be tracked at once: the first one holds the
  * live Toggl timer (Toggl allows only one), the others are written to Toggl as overlapping
  * completed entries. A manual timer you started yourself is never touched.
+ *
+ * Open a session in a folder that is not mapped and the SessionStart hook tells Claude / Gemini,
+ * so the assistant can ask you which project it belongs to and run `map` for you.
  */
 
 const fs = require('fs');
@@ -49,11 +53,14 @@ const DEFAULT_CONFIG = {
   tag: 'ai-session',
   billable: true,
   projects: {}, // "Toggl project name": { id: 123, paths: ["~/Projects/startup"] }
+  ignore: [], // folders never tracked and never asked about
 };
 
 // ---------- small utils ----------
 const nowIso = (ms = Date.now()) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const expandHome = (p) => (p.startsWith('~') ? path.join(HOME, p.slice(1)) : p);
+const tilde = (p) => (p === HOME || p.startsWith(HOME + '/') ? '~' + p.slice(HOME.length) : p);
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch (e) { return false; } };
 function log(msg) {
   try { fs.mkdirSync(DIR, { recursive: true }); fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`); } catch (e) { /* ignore */ }
 }
@@ -163,18 +170,33 @@ async function closeSegment(cfg, st, seg, stopMs, why) {
 const projectName = (cfg, id) => Object.keys(cfg.projects).find((n) => cfg.projects[n].id === id) || String(id);
 
 // ---------- project mapping ----------
+// macOS and Windows file systems are case-insensitive, and tools report the folder however the user typed it.
+const norm = (p) => (process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p);
+// Length of the mapped folder if cwd is it or inside it, else -1.
+function under(cwd, raw) {
+  const base = norm(expandHome(raw).replace(/\/+$/, ''));
+  const c = norm(cwd);
+  return c === base || c.startsWith(base + '/') ? base.length : -1;
+}
 function projectFor(cwd, cfg) {
   if (!cwd) return null;
   let best = null;
   for (const [name, p] of Object.entries(cfg.projects)) {
     for (const raw of p.paths || []) {
-      const base = expandHome(raw).replace(/\/+$/, '');
-      if (cwd === base || cwd.startsWith(base + '/')) {
-        if (!best || base.length > best.len) best = { name, id: p.id, len: base.length };
-      }
+      const len = under(cwd, raw);
+      if (len >= 0 && (!best || len > best.len)) best = { name, id: p.id, len };
     }
   }
   return best;
+}
+const isIgnored = (cwd, cfg) => !!cwd && (cfg.ignore || []).some((raw) => under(cwd, raw) >= 0);
+// Injected into the assistant's context on SessionStart in an unmapped folder, so it can offer to map it.
+function unmappedContext(cwd, cfg) {
+  const known = Object.keys(cfg.projects).map((n) => `"${n}"`).join(', ') || '(none yet — run setup)';
+  const cmd = (rest) => `"${process.execPath}" "${__filename}" ${rest} "${cwd}"`;
+  return `toggl-hook: this folder is not mapped to a Toggl project, so this session is not being time-tracked. Toggl projects: ${known}. `
+    + 'Ask the user which project this repo belongs to, or whether to ignore it, then run one of:\n'
+    + `  ${cmd('map "<Project>"')}\n  ${cmd('ignore')}\nTracking starts on the next prompt.`;
 }
 
 // ---------- hook handling ----------
@@ -198,13 +220,14 @@ async function handleHook(tool) {
   const idleMs = (cfg.idleMinutes || 15) * 60000;
   const syncMs = (cfg.verifyMinutes || 10) * 60000;
 
-  await withLock(async () => {
+  return withLock(async () => {
     const st = loadState();
     try {
       if (!project) {
-        st.lastUnmapped = cwd;
         delete st.sessions[sid];
-        return;
+        if (isIgnored(cwd, cfg)) return undefined;
+        st.lastUnmapped = cwd;
+        return event === 'SessionStart' ? unmappedContext(cwd, cfg) : undefined;
       }
       const seg = st.entries[project.id];
       const tag = `${event} ${toolName} ${project.name}`;
@@ -253,6 +276,7 @@ async function handleHook(tool) {
     } finally {
       writeJson(STATE_FILE, st);
     }
+    return undefined;
   });
 }
 
@@ -292,47 +316,112 @@ async function forceStop() {
 }
 
 // ---------- setup / install ----------
-function ask(rl, q) { return new Promise((r) => rl.question(q, (a) => r(a.trim()))); }
+// Line-buffered prompts: answers typed (or piped) ahead of a question are not lost while we wait on the API.
+function prompter() {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: !!process.stdin.isTTY });
+  const lines = []; const waiting = [];
+  rl.on('line', (l) => { if (waiting.length) waiting.shift()(l); else lines.push(l); });
+  rl.on('close', () => { while (waiting.length) waiting.shift()(''); }); // EOF: remaining questions get the default
+  return {
+    ask: (q) => new Promise((r) => { process.stdout.write(q); if (lines.length) r(lines.shift().trim()); else waiting.push((l) => r(l.trim())); }),
+    close: () => rl.close(),
+  };
+}
+
+// Folders you have already used Claude Code or Gemini CLI in, collapsed to their git repo root.
+function knownFolders() {
+  const listed = [
+    ...Object.keys(readJson(path.join(HOME, '.claude.json'), {}).projects || {}),
+    ...Object.keys(readJson(path.join(HOME, '.gemini', 'projects.json'), {}).projects || {}),
+  ];
+  const real = (p) => { try { return fs.realpathSync.native(p); } catch (e) { return p; } };
+  const H = real(HOME); // e.g. /var → /private/var on macOS
+  const gitRoot = (p) => { for (let d = p; d.startsWith(H + '/'); d = path.dirname(d)) if (fs.existsSync(path.join(d, '.git'))) return d; return p; };
+  const seen = new Map();
+  for (const p of listed) {
+    if (p === HOME || !isDir(p)) continue;
+    const r = gitRoot(real(p)).replace(H, HOME); // back to the home path the user knows
+    seen.set(norm(r), r);
+  }
+  return [...seen.values()].sort();
+}
+
+function addPath(cfg, name, dir) {
+  const clean = tilde(path.resolve(expandHome(dir))).replace(/\/+$/, '');
+  const paths = new Set(cfg.projects[name].paths || []);
+  paths.add(clean);
+  cfg.projects[name].paths = [...paths];
+  cfg.ignore = (cfg.ignore || []).filter((i) => norm(expandHome(i)) !== norm(expandHome(clean)));
+  return clean;
+}
 
 async function setup() {
-  const readline = require('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const p = prompter();
   const cfg = loadConfig();
   console.log('\nToggl Track setup\n-----------------');
   console.log('Your API token is at the bottom of https://track.toggl.com/profile');
-  const token = await ask(rl, `API token${cfg.apiToken ? ' [keep current]' : ''}: `);
+  const token = await p.ask(`API token${cfg.apiToken ? ' [keep current]' : ''}: `);
   if (token) cfg.apiToken = token;
-  if (!cfg.apiToken) { console.log('No token, aborting.'); rl.close(); return; }
+  if (!cfg.apiToken) { console.log('No token, aborting.'); p.close(); return; }
   const me = await api(cfg, 'GET', '/me');
   cfg.workspaceId = me.default_workspace_id;
   console.log(`Hi ${me.fullname}. Workspace ${cfg.workspaceId}.`);
 
-  const projects = (await api(cfg, 'GET', '/me/projects')).filter((p) => p.active !== false);
-  if (!projects.length) console.log('You have no Toggl projects yet — create one in Toggl (e.g. "Startup"), then run setup again.');
-  console.log('\nFor each Toggl project, enter the repo folder(s) that belong to it (comma-separated, ~ allowed). Enter to skip.\n');
-  for (const p of projects) {
-    const existing = cfg.projects[p.name] || {};
-    const cur = (existing.paths || []).join(', ');
-    const a = await ask(rl, `  ${p.name}${cur ? ` [${cur}]` : ''}: `);
-    const paths = a ? a.split(',').map((s) => s.trim()).filter(Boolean) : existing.paths || [];
-    cfg.projects[p.name] = { id: p.id, paths };
+  const projects = (await api(cfg, 'GET', '/me/projects')).filter((pr) => pr.active !== false);
+  for (const pr of projects) cfg.projects[pr.name] = { id: pr.id, paths: (cfg.projects[pr.name] || {}).paths || [] };
+  const names = projects.map((pr) => pr.name);
+  const menu = names.map((n, i) => `[${i + 1}] ${n}`).join('  ');
+  const pick = (a) => names[Number(a) - 1] || names.find((n) => n.toLowerCase() === a.toLowerCase()) || null;
+  if (!names.length) console.log('\nYou have no Toggl projects yet — create one in Toggl (e.g. "Startup"), then run setup again.');
+  else {
+    const pending = knownFolders().filter((f) => !projectFor(f, cfg) && !isIgnored(f, cfg));
+    if (pending.length) {
+      console.log(`\nFolders you have used Claude Code or Gemini CLI in. Pick the Toggl project each belongs to:\n  ${menu}\n  Enter = skip, i = ignore (never ask again), q = stop asking\n`);
+      for (const f of pending) {
+        if (projectFor(f, cfg) || isIgnored(f, cfg)) continue; // covered by an earlier answer
+        const a = await p.ask(`  ${tilde(f)}: `);
+        if (a === 'q') break;
+        if (a === 'i') { cfg.ignore.push(tilde(f)); continue; }
+        const name = a && pick(a);
+        if (name) addPath(cfg, name, f);
+        else if (a) console.log(`    skipped — answer with a number: ${menu}`);
+      }
+    }
+    console.log(`\nOther folders to map? Type "<project number> <path>" (e.g. "1 ~/code/api"), Enter to finish.\n  ${menu}`);
+    for (;;) {
+      const a = await p.ask('  > ');
+      if (!a) break;
+      const m = a.match(/^(\S+)\s+(.+)$/);
+      const name = m && pick(m[1]);
+      if (!name) { console.log(`    usage: <project number> <path>   ${menu}`); continue; }
+      console.log(`    ${name} ← ${addPath(cfg, name, m[2].trim())}`);
+    }
   }
-  const idle = await ask(rl, `\nIdle minutes before the timer stops [${cfg.idleMinutes}]: `);
+  const idle = await p.ask(`\nIdle minutes before the timer stops [${cfg.idleMinutes}]: `);
   if (idle && !Number.isNaN(Number(idle))) cfg.idleMinutes = Number(idle);
-  rl.close();
+  p.close();
   writeJson(CONFIG_FILE, cfg);
   console.log(`\nSaved ${CONFIG_FILE}`);
+  for (const [name, pr] of Object.entries(cfg.projects)) console.log(`  ${name} ← ${(pr.paths || []).join(', ') || '(no folders — map one later, or let Claude/Gemini ask you)'}`);
+  if (cfg.ignore.length) console.log(`  ignored: ${cfg.ignore.join(', ')}`);
   console.log('Next: node toggl-hook.js install');
 }
 
 function mapProject(name, dir) {
   const cfg = loadConfig();
   if (!cfg.projects[name]) { console.log(`Unknown Toggl project "${name}". Known: ${Object.keys(cfg.projects).join(', ') || '(none — run setup)'}`); process.exit(1); }
-  const paths = new Set(cfg.projects[name].paths || []);
-  paths.add(dir.replace(/\/+$/, ''));
-  cfg.projects[name].paths = [...paths];
+  addPath(cfg, name, dir);
   writeJson(CONFIG_FILE, cfg);
-  console.log(`${name} ← ${[...paths].join(', ')}`);
+  console.log(`${name} ← ${cfg.projects[name].paths.join(', ')}`);
+}
+
+function ignoreFolder(dir) {
+  const cfg = loadConfig();
+  const clean = tilde(path.resolve(expandHome(dir))).replace(/\/+$/, '');
+  if (!isIgnored(expandHome(clean), cfg)) cfg.ignore = [...(cfg.ignore || []), clean];
+  writeJson(CONFIG_FILE, cfg);
+  console.log(`Ignored: ${clean} (never tracked, never asked about)`);
 }
 
 function hookCommand(tool) { return `"${process.execPath}" "${INSTALLED_SCRIPT}" hook ${tool}`; }
@@ -416,7 +505,8 @@ function status() {
   }
   const live = Object.values(st.sessions).filter((s) => Date.now() - s.last < cfg.idleMinutes * 60000);
   if (live.length) console.log(`Active sessions: ${live.map((s) => `${s.tool} in ${s.cwd}`).join('; ')}`);
-  if (st.lastUnmapped) console.log(`Last unmapped folder (not tracked): ${st.lastUnmapped}\n  → node toggl-hook.js map "Project" "${st.lastUnmapped}"`);
+  if ((cfg.ignore || []).length) console.log(`Ignored folders: ${cfg.ignore.join(', ')}`);
+  if (st.lastUnmapped && !isIgnored(st.lastUnmapped, cfg)) console.log(`Last unmapped folder (not tracked): ${st.lastUnmapped}\n  → node toggl-hook.js map "Project" "${st.lastUnmapped}"   or   node toggl-hook.js ignore "${st.lastUnmapped}"`);
   if (st.lastError) console.log(`Last error: ${st.lastError}`);
   console.log(`Log: ${LOG_FILE}`);
 }
@@ -428,8 +518,11 @@ function status() {
     switch (cmd) {
       case 'hook': {
         const tool = args[0] === 'gemini' ? 'gemini' : 'claude';
-        try { await handleHook(tool); } catch (e) { log(`FATAL ${e.message}`); }
-        if (tool === 'gemini') process.stdout.write('{}');
+        let ctx;
+        try { ctx = await handleHook(tool); } catch (e) { log(`FATAL ${e.message}`); }
+        // Plain stdout (Claude) / additionalContext (Gemini) on SessionStart reaches the assistant.
+        if (tool === 'gemini') process.stdout.write(JSON.stringify(ctx ? { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: ctx } } : {}));
+        else if (ctx) process.stdout.write(ctx);
         break;
       }
       case 'idle-check': await idleCheck(); break;
@@ -439,6 +532,7 @@ function status() {
       case 'status': status(); break;
       case 'stop': await forceStop(); break;
       case 'map': if (args.length < 2) { console.log('usage: map "Toggl Project" /path'); process.exit(1); } mapProject(args[0], args[1]); break;
+      case 'ignore': if (!args[0]) { console.log('usage: ignore /path'); process.exit(1); } ignoreFolder(args[0]); break;
       default:
         console.log(fs.readFileSync(__filename, 'utf8').split('*/')[0].split('\n').filter((l) => l.startsWith(' *')).map((l) => l.slice(3)).join('\n'));
     }
