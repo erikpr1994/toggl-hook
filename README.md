@@ -7,7 +7,7 @@ Open an AI coding session inside a repo you've mapped to a Toggl project and the
 ```
 you: "refactor the auth middleware"          →  ▶ Startup · Claude Code · api   00:00
    ...prompts, tool calls, responses...       →  ▶ still running
-   ...you go make coffee, 20 min...           →  ■ stopped at your last activity
+   ...no activity for 20 min...              →  ■ stopped at your last activity
 ```
 
 ## Install
@@ -23,7 +23,7 @@ node toggl-hook.js install    # writes hooks into ~/.claude/settings.json and ~/
 ```
 
 `install` copies the script to `~/.timetrack/toggl-hook.js`, so you can delete the clone afterwards.
-Your API token is at the bottom of <https://track.toggl.com/profile>. Create your Toggl projects (e.g. "Startup", "Peak Health") **before** running `setup`, it lists them and asks which folders belong to each.
+Your API token is at the bottom of <https://track.toggl.com/profile>. Create your Toggl projects (e.g. "Startup", "Client A") **before** running `setup`, it lists them and asks which folders belong to each.
 
 On Linux, `install` prints the cron line to add for the idle watchdog.
 
@@ -60,8 +60,8 @@ Tip: `alias tt='node ~/.timetrack/toggl-hook.js'`.
   "tag": "ai-session",
   "billable": true,
   "projects": {
-    "Startup":     { "id": 111, "paths": ["~/code/startup", "~/code/startup-infra"] },
-    "Peak Health": { "id": 222, "paths": ["~/code/peakhealth"] }
+    "Startup":  { "id": 111, "paths": ["~/code/startup", "~/code/startup-infra"] },
+    "Client A": { "id": 222, "paths": ["~/code/client-a"] }
   }
 }
 ```

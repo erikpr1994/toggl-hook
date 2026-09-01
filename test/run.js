@@ -27,7 +27,7 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   await sleep(300);
   fs.writeFileSync(path.join(TT_DIR, 'config.json'), JSON.stringify({
     apiToken: 'tok', workspaceId: 42, idleMinutes: 15,
-    projects: { Startup: { id: 1, paths: ['~/Projects/startup', '/repos/startup-api'] }, 'Peak Health': { id: 2, paths: ['/repos/peak'] } },
+    projects: { Startup: { id: 1, paths: ['~/Projects/startup', '/repos/startup-api'] }, 'Client A': { id: 2, paths: ['/repos/client-a'] } },
   }));
 
   // 1. unmapped folder → nothing happens
@@ -58,7 +58,7 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   //    (Toggl allows one running timer; the parallel one becomes a completed, overlapping entry)
   const min = (n) => new Date(Date.now() - n * 60000).toISOString();
   let st = state(); st.entries[1].start = min(5); fs.writeFileSync(STATE, JSON.stringify(st));
-  hook('claude', 'UserPromptSubmit', 's3', '/repos/peak/app');
+  hook('claude', 'UserPromptSubmit', 's3', '/repos/client-a/app');
   es = await entries();
   assert.strictEqual(es.length, 1, 'no Toggl entry for the parallel project yet'); assert.strictEqual(es[0].duration, -1, 'first still running');
   st = state();
@@ -67,19 +67,19 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
 
   // 5b. activity in the parallel project after verifyMinutes writes it to Toggl as a completed entry, overlapping the live one
   st.entries[2].start = min(12); st.entries[2].lastSync = Date.now() - 11 * 60000; fs.writeFileSync(STATE, JSON.stringify(st));
-  hook('claude', 'PostToolUse', 's3', '/repos/peak/app');
+  hook('claude', 'PostToolUse', 's3', '/repos/client-a/app');
   es = await entries();
   assert.strictEqual(es.length, 2); assert.strictEqual(es[0].duration, -1, 'live timer untouched');
-  let peak = es.find((e) => e.project_id === 2);
-  assert.ok(Math.abs(peak.duration - 720) <= 2, `parallel entry ~720s, got ${peak.duration}`); assert.ok(peak.stop, 'completed entry');
-  assert.strictEqual(peak.description, 'Claude Code · app'); assert.deepStrictEqual(peak.tags, ['ai-session']);
-  assert.strictEqual(state().entries[2].id, peak.id);
+  let client = es.find((e) => e.project_id === 2);
+  assert.ok(Math.abs(client.duration - 720) <= 2, `parallel entry ~720s, got ${client.duration}`); assert.ok(client.stop, 'completed entry');
+  assert.strictEqual(client.description, 'Claude Code · app'); assert.deepStrictEqual(client.tags, ['ai-session']);
+  assert.strictEqual(state().entries[2].id, client.id);
 
   // 5c. ...and is extended on the next sync
   st = state(); st.entries[2].lastSync = Date.now() - 11 * 60000; st.entries[2].start = min(20); fs.writeFileSync(STATE, JSON.stringify(st));
-  hook('claude', 'PostToolUse', 's3', '/repos/peak/app');
-  peak = (await entries()).find((e) => e.project_id === 2);
-  assert.ok(Math.abs(peak.duration - 1200) <= 2, `extended to ~1200s, got ${peak.duration}`);
+  hook('claude', 'PostToolUse', 's3', '/repos/client-a/app');
+  client = (await entries()).find((e) => e.project_id === 2);
+  assert.ok(Math.abs(client.duration - 1200) <= 2, `extended to ~1200s, got ${client.duration}`);
 
   // 6. idle: only the idle project is closed, at its last activity. The live one (still active) keeps running.
   st = state();
@@ -87,8 +87,8 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   fs.writeFileSync(STATE, JSON.stringify(st));
   run(['idle-check']);
   es = await entries();
-  peak = es.find((e) => e.project_id === 2);
-  assert.ok(Math.abs(peak.duration - 600) <= 2, `duration should be ~600s, got ${peak.duration}`);
+  client = es.find((e) => e.project_id === 2);
+  assert.ok(Math.abs(client.duration - 600) <= 2, `duration should be ~600s, got ${client.duration}`);
   assert.strictEqual(state().entries[2], undefined); assert.strictEqual(es.find((e) => e.project_id === 1).duration, -1);
 
   // 6b. the live one goes idle too → stopped at last activity
@@ -99,7 +99,7 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   assert.deepStrictEqual(state().entries, {});
 
   // 7. idle stop of an entry shorter than a minute deletes it (live) / never creates it (parallel)
-  hook('claude', 'UserPromptSubmit', 's4', '/repos/peak');
+  hook('claude', 'UserPromptSubmit', 's4', '/repos/client-a');
   hook('claude', 'UserPromptSubmit', 's4b', '/repos/startup-api');
   st = state();
   for (const id of [1, 2]) { st.entries[id].last = Date.now() - 20 * 60000; st.entries[id].start = new Date(Date.now() - 20 * 60000 - 30000).toISOString(); }
@@ -148,7 +148,7 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
 
   // 9d. v1.0 state file (single `entry`) is migrated
   fs.writeFileSync(STATE, JSON.stringify({ entry: { id: 7, projectId: 2, start: min(3) }, lastActivity: Date.now(), lastVerify: Date.now(), sessions: {} }));
-  assert.match(run(['status']), /Running: Peak Health \(live Toggl timer\)/);
+  assert.match(run(['status']), /Running: Client A \(live Toggl timer\)/);
   fs.writeFileSync(STATE, JSON.stringify({ entries: {}, sessions: {} }));
 
   // 10. parallel hooks racing don't create duplicate timers
@@ -163,12 +163,12 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   assert.strictEqual(es.length, before + 1, 'no duplicate started by race');
 
   // 11. status / stop close every tracked project
-  hook('claude', 'UserPromptSubmit', 's8', '/repos/peak');
+  hook('claude', 'UserPromptSubmit', 's8', '/repos/client-a');
   st = state(); st.entries[1].start = min(3); st.entries[2].start = min(3); fs.writeFileSync(STATE, JSON.stringify(st));
   const out = run(['status']);
-  assert.match(out, /Running: Startup \(live Toggl timer\)/); assert.match(out, /Tracking: Peak Health \(parallel, not in Toggl yet/);
+  assert.match(out, /Running: Startup \(live Toggl timer\)/); assert.match(out, /Tracking: Client A \(parallel, not in Toggl yet/);
   const stopOut = run(['stop']);
-  assert.match(stopOut, /Startup: stopped/); assert.match(stopOut, /Peak Health: stopped/);
+  assert.match(stopOut, /Startup: stopped/); assert.match(stopOut, /Client A: stopped/);
   es = await entries();
   assert.strictEqual(es.filter((e) => e.duration < 0).length, 0);
   assert.ok(Math.abs(es[es.length - 1].duration - 180) <= 2, 'parallel entry written by stop'); assert.strictEqual(es[es.length - 1].project_id, 2);
@@ -176,7 +176,7 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
 
   // 12. broken API → hook still exits 0 and records the error
   const envDown = { ...env, TOGGL_API_BASE: 'http://127.0.0.1:1' };
-  const r = spawnSync(process.execPath, [SCRIPT, 'hook', 'claude'], { env: envDown, input: JSON.stringify({ session_id: 'y', cwd: '/repos/peak', hook_event_name: 'UserPromptSubmit' }), encoding: 'utf8' });
+  const r = spawnSync(process.execPath, [SCRIPT, 'hook', 'claude'], { env: envDown, input: JSON.stringify({ session_id: 'y', cwd: '/repos/client-a', hook_event_name: 'UserPromptSubmit' }), encoding: 'utf8' });
   assert.strictEqual(r.status, 0); assert.strictEqual(r.stdout, ''); assert.match(state().lastError, /fetch|ECONNREFUSED/i);
 
   console.log('all tests passed');

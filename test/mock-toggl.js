@@ -13,7 +13,7 @@ const server = http.createServer((req, res) => {
     const url = req.url.replace(/\?.*$/, '');
     if (!/^Basic /.test(req.headers.authorization || '')) return send(res, 403, { error: 'no auth' });
     if (req.method === 'GET' && url === '/me') return send(res, 200, { fullname: 'Test User', default_workspace_id: 42 });
-    if (req.method === 'GET' && url === '/me/projects') return send(res, 200, [{ id: 1, name: 'Startup', active: true }, { id: 2, name: 'Peak Health', active: true }]);
+    if (req.method === 'GET' && url === '/me/projects') return send(res, 200, [{ id: 1, name: 'Startup', active: true }, { id: 2, name: 'Client A', active: true }]);
     if (req.method === 'GET' && url === '/me/time_entries/current') return send(res, 200, entries.find((e) => e.duration < 0) || null);
     if (req.method === 'GET' && url === '/_entries') return send(res, 200, entries);
     if (req.method === 'POST' && url === '/_manual') { // test helper: user starts a manual timer
