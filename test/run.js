@@ -98,6 +98,21 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   assert.ok(Math.abs(startup.duration - 600) <= 2, `live stopped at last activity, got ${startup.duration}`);
   assert.deepStrictEqual(state().entries, {});
 
+  // 6c. a stop whose sub-second remainder rounds up must still land: Toggl rejects a duration
+  // that disagrees with stop - start, and a rejected stop used to leave the timer running for days.
+  hook('claude', 'UserPromptSubmit', 's9', '/repos/client-a');
+  st = state();
+  const started = Math.floor(Date.now() / 1000) * 1000 - 40 * 60000; // whole second
+  st.entries[2] = { ...st.entries[2], id: null, start: new Date(started).toISOString(), live: false, lastSync: 0, last: started + 10 * 60000 + 833 };
+  fs.writeFileSync(STATE, JSON.stringify(st));
+  run(['idle-check']);
+  assert.strictEqual(state().entries[2], undefined, 'a .833 s remainder must not block the stop');
+  assert.strictEqual(state().lastError, '', 'no API error on stop');
+  const rounded = (await entries()).filter((e) => e.project_id === 2).pop();
+  assert.strictEqual(rounded.duration, 600, `duration must match stop - start, got ${rounded.duration}`);
+  await fetch(`http://127.0.0.1:${PORT}/workspaces/42/time_entries/${rounded.id}`, { method: 'DELETE', headers: { Authorization: 'Basic x' } });
+  hook('claude', 'SessionEnd', 's9', '/repos/client-a');
+
   // 7. idle stop of an entry shorter than a minute deletes it (live) / never creates it (parallel)
   hook('claude', 'UserPromptSubmit', 's4', '/repos/client-a');
   hook('claude', 'UserPromptSubmit', 's4b', '/repos/startup-api');

@@ -4,6 +4,9 @@ const http = require('http');
 const entries = [];
 let nextId = 1000;
 const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(obj === undefined ? '' : JSON.stringify(obj)); };
+// Toggl validates that a completed entry's duration matches stop - start, to the second.
+const mismatch = (e) => e.stop && e.duration >= 0
+  && Math.floor(Date.parse(e.stop) / 1000) - Math.floor(Date.parse(e.start) / 1000) !== e.duration;
 
 const server = http.createServer((req, res) => {
   let body = '';
@@ -23,12 +26,18 @@ const server = http.createServer((req, res) => {
     let m;
     if (req.method === 'POST' && (m = url.match(/^\/workspaces\/(\d+)\/time_entries$/))) {
       if (j.duration < 0) for (const e of entries) if (e.duration < 0) { e.duration = 1; e.stop = new Date().toISOString(); } // starting a timer auto-stops the previous one; completed entries may overlap
-      const e = { id: nextId++, workspace_id: Number(m[1]), ...j }; entries.push(e); return send(res, 200, e);
+      const e = { id: nextId++, workspace_id: Number(m[1]), ...j };
+      if (mismatch(e)) return send(res, 400, 'Stop and duration mismatch');
+      entries.push(e); return send(res, 200, e);
     }
     if ((m = url.match(/^\/workspaces\/\d+\/time_entries\/(\d+)$/))) {
       const e = entries.find((x) => x.id === Number(m[1]));
       if (!e) return send(res, 404, { error: 'not found' });
-      if (req.method === 'PUT') { Object.assign(e, j); return send(res, 200, e); }
+      if (req.method === 'PUT') {
+        const next = { ...e, ...j };
+        if (mismatch(next)) return send(res, 400, 'Stop and duration mismatch');
+        Object.assign(e, j); return send(res, 200, e);
+      }
       if (req.method === 'DELETE') { entries.splice(entries.indexOf(e), 1); return send(res, 200); }
     }
     send(res, 404, { error: `unhandled ${req.method} ${url}` });

@@ -58,6 +58,11 @@ const DEFAULT_CONFIG = {
 
 // ---------- small utils ----------
 const nowIso = (ms = Date.now()) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+// Toggl rejects an entry whose duration disagrees with stop - start ('Stop and duration mismatch').
+// nowIso truncates to whole seconds, so the duration has to be derived from the truncated values too:
+// rounding here would be one second over whenever the remainder is >= 500 ms, and the stop would never land.
+const secs = (ms) => Math.floor(ms / 1000);
+const durationSecs = (startMs, stopMs) => secs(stopMs) - secs(startMs);
 const expandHome = (p) => (p.startsWith('~') ? path.join(HOME, p.slice(1)) : p);
 const tilde = (p) => (p === HOME || p.startsWith(HOME + '/') ? '~' + p.slice(HOME.length) : p);
 const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch (e) { return false; } };
@@ -130,7 +135,7 @@ function createEntry(cfg, projectId, description, startMs, stopMs) {
     workspace_id: cfg.workspaceId, project_id: projectId, description, tags: [cfg.tag], billable: !!cfg.billable,
     start: nowIso(startMs), duration: -1, created_with: 'toggl-hook',
   };
-  if (stopMs) { body.stop = nowIso(stopMs); body.duration = Math.round((stopMs - startMs) / 1000); }
+  if (stopMs) { body.stop = nowIso(stopMs); body.duration = durationSecs(startMs, stopMs); }
   return api(cfg, 'POST', `/workspaces/${cfg.workspaceId}/time_entries`, body);
 }
 
@@ -141,7 +146,7 @@ function createEntry(cfg, projectId, description, startMs, stopMs) {
 // `verifyMinutes` while active, finalised when they close. Entries shorter than a minute never reach Toggl.
 async function syncSegment(cfg, seg, stopMs, final) {
   const startMs = Date.parse(seg.start);
-  const duration = Math.round((stopMs - startMs) / 1000);
+  const duration = durationSecs(startMs, stopMs);
   if (duration < 60) {
     if (!seg.id || !final) return 'skipped';
     await api(cfg, 'DELETE', `/workspaces/${cfg.workspaceId}/time_entries/${seg.id}`);
@@ -152,7 +157,7 @@ async function syncSegment(cfg, seg, stopMs, final) {
     return 'created';
   }
   await api(cfg, 'PUT', `/workspaces/${cfg.workspaceId}/time_entries/${seg.id}`, {
-    workspace_id: cfg.workspaceId, stop: nowIso(stopMs), duration, created_with: 'toggl-hook',
+    workspace_id: cfg.workspaceId, start: nowIso(startMs), stop: nowIso(stopMs), duration, created_with: 'toggl-hook',
   });
   return final ? 'stopped' : 'extended';
 }
