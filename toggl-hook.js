@@ -204,6 +204,33 @@ function unmappedContext(cwd, cfg) {
     + `  ${cmd('map "<Project>"')}\n  ${cmd('ignore')}\nTracking starts on the next prompt.`;
 }
 
+// Claude Code (from web or mobile) and orca each run a session in its own git worktree, and a
+// monorepo is usually entered from a package subfolder, so basename(cwd) is rarely the repo name:
+// it comes out as a session id ("bridge-cse_01PJ5..."), a task slug, or a package name. Resolve the
+// repo the worktree belongs to and keep whatever sits below it as detail: "peakhealth (apps/web)".
+function describeCwd(cwd) {
+  const fallback = path.basename(cwd);
+  let out;
+  try {
+    out = execSync('git rev-parse --path-format=absolute --git-common-dir --show-toplevel', {
+      cwd, encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (e) { return fallback; } // not a repo, or no git on PATH
+  const [commonDir, top] = out.trim().split('\n');
+  if (!commonDir || !top) return fallback;
+  // A linked worktree's common dir is the main repo's .git; the main worktree's is its own.
+  const root = path.basename(commonDir) === '.git' ? path.dirname(commonDir) : top;
+  const parts = [];
+  if (path.resolve(top) !== path.resolve(root)) parts.push(path.basename(top)); // the worktree's name
+  // git reports real paths, so compare against one: on macOS /tmp and /var are symlinks.
+  let real = cwd;
+  try { real = fs.realpathSync(cwd); } catch (e) { /* keep cwd */ }
+  const below = path.relative(top, real);
+  if (below && !below.startsWith('..')) parts.push(below);
+  const detail = parts.join('/');
+  return detail ? `${path.basename(root)} (${detail.length > 60 ? detail.slice(0, 59) + '…' : detail})` : path.basename(root);
+}
+
 // ---------- hook handling ----------
 function parseHook(tool, raw) {
   let j = {};
@@ -257,7 +284,7 @@ async function handleHook(tool) {
       }
 
       // New segment. It takes the live Toggl timer unless another project (or a manual timer) already holds it.
-      const fresh = { id: null, projectId: project.id, start: nowIso(now), desc: `${toolName} · ${path.basename(cwd)}`, live: false, last: now, lastSync: now };
+      const fresh = { id: null, projectId: project.id, start: nowIso(now), desc: `${toolName} · ${describeCwd(cwd)}`, live: false, last: now, lastSync: now };
       let how = 'parallel';
       if (!Object.values(st.entries).some((s) => s.live)) {
         const cur = await getCurrent(cfg);

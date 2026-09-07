@@ -113,6 +113,36 @@ const hook = (tool, event, sid, cwd) => run(['hook', tool], JSON.stringify({ ses
   await fetch(`http://127.0.0.1:${PORT}/workspaces/42/time_entries/${rounded.id}`, { method: 'DELETE', headers: { Authorization: 'Basic x' } });
   hook('claude', 'SessionEnd', 's9', '/repos/client-a');
 
+  // 6d. the description names the repo, not the folder the session happened to open in:
+  // worktrees (Claude Code from web, orca) and monorepo subfolders used to leak session ids and package names.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-repo-')) + '/peakhealth';
+  fs.mkdirSync(path.join(repo, 'apps/web'), { recursive: true });
+  const git = (args, cwd) => spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  git(['init', '-q', '-b', 'main'], repo);
+  fs.writeFileSync(path.join(repo, 'README'), 'x');
+  git(['add', '-A'], repo); git(['commit', '-qm', 'init'], repo);
+  git(['worktree', 'add', '-q', '-b', 'wt', '.claude/worktrees/bridge-cse_01ABC'], repo);
+  fs.mkdirSync(path.join(repo, '.claude/worktrees/bridge-cse_01ABC/apps'), { recursive: true });
+  st = state(); st.entries = {}; fs.writeFileSync(STATE, JSON.stringify(st));
+  const preDesc = new Set((await entries()).map((e) => e.id));
+  const cfgFile = path.join(TT_DIR, 'config.json');
+  const saved = fs.readFileSync(cfgFile, 'utf8');
+  fs.writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(saved), projects: { Startup: { id: 1, paths: [repo] } } }));
+  const descFor = (cwd, sid) => {
+    hook('claude', 'UserPromptSubmit', sid, cwd);
+    const d = state().entries[1].desc;
+    st = state(); delete st.entries[1]; fs.writeFileSync(STATE, JSON.stringify(st));
+    return d;
+  };
+  assert.strictEqual(descFor(repo, 'g1'), 'Claude Code · peakhealth', 'repo root');
+  assert.strictEqual(descFor(path.join(repo, 'apps/web'), 'g2'), 'Claude Code · peakhealth (apps/web)', 'monorepo subfolder');
+  assert.strictEqual(descFor(path.join(repo, '.claude/worktrees/bridge-cse_01ABC'), 'g3'), 'Claude Code · peakhealth (bridge-cse_01ABC)', 'linked worktree');
+  assert.strictEqual(descFor(path.join(repo, '.claude/worktrees/bridge-cse_01ABC/apps'), 'g4'), 'Claude Code · peakhealth (bridge-cse_01ABC/apps)', 'subfolder of a worktree');
+  fs.writeFileSync(cfgFile, saved);
+  st = state(); for (const sid of ['g1', 'g2', 'g3', 'g4']) delete st.sessions[sid];
+  st.entries = {}; fs.writeFileSync(STATE, JSON.stringify(st));
+  for (const e of await entries()) if (!preDesc.has(e.id)) await fetch(`http://127.0.0.1:${PORT}/workspaces/42/time_entries/${e.id}`, { method: 'DELETE', headers: { Authorization: 'Basic x' } });
+
   // 7. idle stop of an entry shorter than a minute deletes it (live) / never creates it (parallel)
   hook('claude', 'UserPromptSubmit', 's4', '/repos/client-a');
   hook('claude', 'UserPromptSubmit', 's4b', '/repos/startup-api');
